@@ -1,8 +1,9 @@
-# app_backtest.py
+# app_backtest_stopmode.py
 # =========================================================
 # Backtest Streamlit — Long Only (ETH) con parametri estesi
 # Fonte dati: Binance (ccxt/REST) o Sintetico (up/down)
-# Import/Export profili JSON (senza conflitti session_state)
+# Import/Export profili JSON (senza rerun; applica su next run)
+# Stop mode: Percentuale | ATR | Min(Percent, ATR)
 # =========================================================
 
 import streamlit as st
@@ -12,7 +13,6 @@ import json
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
-from datetime import time as dtime
 
 # -------------------------
 # CCXT opzionale
@@ -23,7 +23,7 @@ try:
 except Exception:
     HAS_CCXT = False
 
-st.set_page_config(page_title="ETH Backtest — Long Only (Full Params)", layout="wide")
+st.set_page_config(page_title="ETH Backtest — Long Only (Stop Modes)", layout="wide")
 
 # -------------------------
 # Default config (base + extra)
@@ -45,6 +45,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "tp_ladder": [0.06, 0.12, 0.2],
     "tp_fractions": [0.4, 0.3, 0.3],
     "tp_anticipation_pct": 0.0,     # esce prima del target (0.01 = -1%)
+    "stop_mode": "Percentuale",     # Percentuale | ATR | Minimo
 
     # Trailing
     "trailing_start_pct": 0.10,
@@ -60,7 +61,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # Volatilità/filtri
     "atr_period": 14,
-    "atr_multiplier": 2.0,
+    "atr_multiplier": 2.0,          # usato per stop ATR e/o sizing floor
     "adx_period": 14,
     "adx_min": 0.0,                  # 20-25 = trend forte (0 = disattivo)
     "atr_filter_min": 0.0,           # come % del prezzo: atr/close >= min
@@ -72,7 +73,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "time_stop_bars": 0,             # 0 = no time stop
     "force_close_bars": 0,           # 0 = no force close a N barre
 
-    # Sessioni orarie locale (ora/ora) — 24h se uguali
+    # Sessioni orarie (0-24); se start==end => 24h
     "session_start_h": 0,
     "session_end_h": 24,
 
@@ -80,8 +81,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "use_multi_tf_trend": False,
     "higher_tf_multiplier": 4,       # es. 4 * ema_slow ~ 4H se TF=1H
 
-    # Protezioni giornaliere
-    "daily_loss_limit_pct": 1.0,     # 1% (0 = off)
+    # Protezioni
+    "daily_loss_limit_pct": 1.0,     # 1% (0 = off) calcolato sul capitale iniziale
     "equity_stop_pct": 0.0,          # stop globale sull’equity (0 = off)
 
     # Data source
@@ -127,9 +128,41 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # -------------------------
 # Data helpers
 # -------------------------
-def fetch_ohlcv_ccxt(symbol: str, timeframe: str, limit: int = 1000) -> Optional[pd.DataFrame]:
+def fetch_ohlcv_ccxt(symbol: str, timeframe: str, limit: int = 1000, exchange_name: str = "binance") -> Optional[pd.DataFrame]:
+    """
+    Scarica dati OHLCV da vari exchange via ccxt.
+    exchange_name può essere: binance, bybit, okx, kraken, coinbase, ecc.
+    Prova automaticamente la variante /USD se /USDT non è supportata.
+    """
     if not HAS_CCXT:
         st.error("ccxt non installato. `pip install ccxt`")
+        return None
+    try:
+        # Istanzia l'exchange in base al nome
+        if not hasattr(ccxt, exchange_name):
+            st.error(f"Exchange non supportato in ccxt: {exchange_name}")
+            return None
+        exchange_class = getattr(ccxt, exchange_name)
+        ex = exchange_class({'enableRateLimit': True})
+
+        # Alcuni exchange hanno nomi simbolo diversi (USDT vs USD)
+        tried = []
+        for sym in [symbol, symbol.replace("USDT", "USD")]:
+            try:
+                tried.append(sym)
+                ohlcv = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=int(limit))
+                break
+            except Exception:
+                ohlcv = None
+        if not ohlcv:
+            raise RuntimeError(f"Impossibile fetch OHLCV da {exchange_name} per i simboli provati: {tried}")
+
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.set_index('timestamp').astype(float)
+        return df[['open','high','low','close','volume']]
+    except Exception as e:
+        st.error(f"Errore fetch {exchange_name} (ccxt): {e}")
         return None
     try:
         ex = ccxt.binance({'enableRateLimit': True})
@@ -179,7 +212,7 @@ def synthetic_data(n: int = 1000, seed: int = 42, drift: float = 0.001, vol: flo
     return pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols}, index=idx)
 
 # -------------------------
-# Profili (import/export) — NO mutate after widgets
+# Profili (import/export) — NO rerun
 # -------------------------
 PROFILE_DIR = Path("configs"); PROFILE_DIR.mkdir(exist_ok=True)
 
@@ -188,11 +221,10 @@ def merge_defaults(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, A
     out.update({k:v for k,v in overlay.items() if v is not None})
     return out
 
-# Se l’utente ha caricato un profilo in una run precedente, usarlo come default
+# Applica profilo (se presente) PRIMA dei widget
 if "pending_profile" in st.session_state:
     DEFAULT_CONFIG = merge_defaults(DEFAULT_CONFIG, st.session_state["pending_profile"])
     del st.session_state["pending_profile"]
-
 
 # -------------------------
 # Backtest Engine (Long Only)
@@ -205,35 +237,35 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
     df["ema_slow"] = ema(df["close"], c["ema_slow"])
     df["atr"] = atr(df, c["atr_period"])
     df["vol_ma"] = df["volume"].rolling(20, min_periods=1).mean()
-    dh, dl = donchian(df, period=max(2, int(c["ema_fast"])))  # solo per comodo (non usato direttamente)
-    df["don_high"], df["don_low"] = dh, dl
     df["adx"] = adx(df, c["adx_period"])
 
-    # Multi-TF trend “approssimato” (ema_slow * multiplier)
+    # Multi-TF trend “approssimato”
     if c.get("use_multi_tf_trend", False):
         df["ema_slow_htf"] = ema(df["close"], int(c["ema_slow"] * max(1, int(c["higher_tf_multiplier"]))))
+    else:
+        df["ema_slow_htf"] = df["ema_slow"]
 
-    # Normalizza TP
+    # Normalizza TP (con anticipo)
     tp_ladder = list(c.get("tp_ladder", [0.06,0.12,0.2]))
     tp_frac = list(c.get("tp_fractions", [0.4,0.3,0.3]))
     s = sum(tp_frac); tp_frac = [f/s for f in tp_frac] if s > 0 else [1.0/len(tp_frac)]*len(tp_frac)
     tp_anticip = float(c.get("tp_anticipation_pct", 0.0))
-    tp_factors = [(1.0 + tp) * (1.0 - tp_anticip) for tp in tp_ladder]  # anticipo TP
+    tp_factors = [(1.0 + tp) * (1.0 - tp_anticip) for tp in tp_ladder]
 
     # Contabilità
     cash = float(c["initial_capital"])
     fee_pct = float(c["fee_pct"])
     slip = float(c["slippage_pct"])
     risk_pct = float(c["risk_per_trade_pct"])
-    equity_hist: List[Dict[str, Any]] = []
+
     trades: List[Dict[str, Any]] = []
+    eq_list: List[Dict[str, Any]] = []
     position: Optional[Dict[str, Any]] = None
     pending_entry_idx: Optional[int] = None
     cooldown = 0
-    bars_since_entry = 0
+    trades_today = 0
     daily_pnl = 0.0
     current_day = None
-    trades_today = 0
 
     def in_session(ts: pd.Timestamp) -> bool:
         sh, eh = int(c["session_start_h"]), int(c["session_end_h"])
@@ -243,7 +275,6 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
         if sh < eh:
             return sh <= hh < eh
         else:
-            # fascia che passa mezzanotte (es. 22-06)
             return hh >= sh or hh < eh
 
     n = len(df)
@@ -251,52 +282,38 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
         t = df.index[i]
         row = df.iloc[i]
 
-        # reset contatori giornalieri
-        day = t.date()
-        if current_day is None or day != current_day:
-            current_day = day
-            daily_pnl = 0.0
+        # reset day
+        if current_day is None or t.date() != current_day:
+            current_day = t.date()
             trades_today = 0
+            daily_pnl = 0.0
 
-        # Protezione equity stop globale
-        if float(c.get("equity_stop_pct", 0.0)) > 0:
-            # equity mark-to-market corrente
-            mtm = position["remaining_size"]*row["close"] if position else 0.0
-            eq_now = cash + mtm
-            if eq_now <= c["initial_capital"] * (1.0 - float(c["equity_stop_pct"])):
-                if position:
-                    # chiusura d’emergenza
-                    px = row["close"] * (1 - slip)
-                    proceeds = position["remaining_size"] * px
-                    fee = proceeds * fee_pct
-                    cash += proceeds - fee
-                    trades.append({"type":"FORCE_STOP","time":t,"price":px,"size":position["remaining_size"]})
-                    position = None
-                break  # stop totale
-
-        # Esegui pending entry (open barra i)
+        # Esegui pending entry all'open barra i
         if pending_entry_idx is not None and pending_entry_idx == i:
-            if not in_session(t):
-                pending_entry_idx = None  # fuori sessione
-            elif trades_today >= int(c["max_trades_per_day"]):
-                pending_entry_idx = None
-            else:
-                # Calcolo entry/SL
+            if in_session(t) and trades_today < int(c["max_trades_per_day"]):
                 entry = row["open"] * (1 + slip)
-                stop = entry * (1.0 - float(c["stop_loss_pct"]))
-                # Filtro ATR min/max (% del prezzo)
-                atr_rel = (row["atr"] / row["close"]) if row["close"] > 0 else 0.0
-                if atr_rel < float(c["atr_filter_min"]) or atr_rel > float(c["atr_filter_max"]):
-                    pending_entry_idx = None
-                else:
-                    # Position sizing con rischio
-                    R = max(entry - stop, 1e-8)
+
+                # Stop candidates
+                stop_pct = entry * (1.0 - float(c["stop_loss_pct"]))
+                stop_atr = entry - float(c["atr_multiplier"]) * float(row["atr"])
+
+                mode = c.get("stop_mode","Percentuale")
+                if mode == "Percentuale":
+                    stop = stop_pct
+                elif mode == "ATR":
+                    stop = stop_atr
+                else:  # Minimo tra i due
+                    # Prezzi positivi -> lo stop "più vicino all'entry" è quello con prezzo più alto
+                    stop = max(stop_pct, stop_atr)
+
+                # Filtro ATR% (ambiente negoziabile)
+                atr_rel = (row["atr"]/row["close"]) if row["close"]>0 else 0.0
+                if atr_rel >= float(c["atr_filter_min"]) and atr_rel <= float(c["atr_filter_max"]):
+                    R = max(entry - stop, 1e-9)
                     risk_amt = cash * risk_pct
-
-                    # Dynamic position sizing (opzionale): usa ATR come min R
-                    if float(c.get("atr_multiplier", 0.0)) > 0:
+                    # sizing floor su ATR (opzionale): garantisce R minimo
+                    if float(c["atr_multiplier"]) > 0:
                         R = max(R, float(c["atr_multiplier"]) * float(row["atr"]))
-
                     size = risk_amt / R
                     notional = size * entry
                     fee = notional * fee_pct
@@ -320,23 +337,20 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                         trades.append({"type":"ENTRY","time":t,"price":entry,"size":size})
                         trades_today += 1
                         cooldown = int(c["cooldown_bars"])
-                        bars_since_entry = 0
             pending_entry_idx = None
 
         # Gestione posizione
         if position is not None:
-            bars_since_entry += 1
             position["bars_open"] += 1
-            # Aggiorna max
             position["max_price"] = max(position["max_price"], row["high"])
 
-            # Breakeven stop
+            # Breakeven
             if float(c.get("breakeven_stop_pct",0.0)) > 0:
                 be_level = position["entry_price"] * (1.0 + float(c["breakeven_stop_pct"]))
                 if row["high"] >= be_level:
                     position["stop"] = max(position["stop"], position["entry_price"])
 
-            # Stop loss colpito?
+            # SL
             if row["low"] <= position["stop"]:
                 px = position["stop"] * (1 - slip)
                 size = position["remaining_size"]
@@ -347,9 +361,8 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                 trades.append({"type":"SL","time":t,"price":px,"size":size,"pnl":pnl})
                 daily_pnl += pnl
                 position = None
-
             else:
-                # Take profits parziali
+                # TP parziali
                 for j, tp_level in enumerate(position["tp_prices"]):
                     if (not position["tp_taken"][j]) and (row["high"] >= tp_level):
                         px = tp_level * (1 - slip)
@@ -381,7 +394,7 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                             daily_pnl += pnl
                             position = None
 
-                # Time stop / Force close bars
+                # Time stop / Force close
                 if position is not None:
                     if int(c.get("time_stop_bars",0)) > 0 and position["bars_open"] >= int(c["time_stop_bars"]):
                         px = row["close"] * (1 - slip)
@@ -393,7 +406,6 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                         trades.append({"type":"TIME_STOP","time":t,"price":px,"size":size,"pnl":pnl})
                         daily_pnl += pnl
                         position = None
-
                     elif int(c.get("force_close_bars",0)) > 0 and position["bars_open"] >= int(c["force_close_bars"]):
                         px = row["close"] * (1 - slip)
                         size = position["remaining_size"]
@@ -405,61 +417,50 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                         daily_pnl += pnl
                         position = None
 
-                # Se chiusa tutta con TP parziali
                 if position is not None and position["remaining_size"] <= 1e-12:
                     position = None
 
-        # Nuove entry? (se flat, nessun pending)
+        # Nuove entry se flat
         if position is None and pending_entry_idx is None and i < n-1:
+            # daily loss limit
+            if float(c.get("daily_loss_limit_pct",0.0)) > 0:
+                if daily_pnl <= -abs(float(c["daily_loss_limit_pct"]) * float(c["initial_capital"])):
+                    pass  # stop per la giornata
             # cooldown
             if cooldown > 0:
                 cooldown -= 1
             else:
-                # limiti giornalieri
-                if trades_today < int(c["max_trades_per_day"]) and in_session(t):
-                    # Filtro daily loss
-                    if float(c.get("daily_loss_limit_pct",0.0)) > 0:
-                        # equity base per giorno = capitale iniziale + cum pnl giorni precedenti (sempl.)
-                        # qui applichiamo limite solo sul PnL del giorno
-                        if daily_pnl <= -abs(float(c["daily_loss_limit_pct"]) * c["initial_capital"]):
-                            pass  # saltare segnali fino a domani
-                        else:
-                            # condizioni di segnale
-                            prev_high = df["high"].iloc[i-1] if i >= 1 else df["high"].iloc[i]
-                            breakout = row["high"] > prev_high * (1.0 + float(c["breakout_threshold_pct"]))
-                            vol_ok = row["volume"] >= df["vol_ma"].iloc[i] * float(c["min_volume_factor"])
+                # condizioni segnale
+                if in_session(t) and trades_today < int(c["max_trades_per_day"]):
+                    prev_high = df["high"].iloc[i-1] if i >= 1 else df["high"].iloc[i]
+                    breakout = row["high"] > prev_high * (1.0 + float(c["breakout_threshold_pct"]))
+                    vol_ok = row["volume"] >= df["vol_ma"].iloc[i] * float(c["min_volume_factor"])
 
-                            # trend condition
-                            tc = c.get("trend_condition","fast_above_slow")
-                            if tc == "fast_above_slow":
-                                trend_ok = row["ema_fast"] > row["ema_slow"]
-                            elif tc == "both_above":
-                                trend_ok = (row["close"] > row["ema_fast"]) and (row["close"] > row["ema_slow"])
-                            else:
-                                trend_ok = True
+                    tc = c.get("trend_condition","fast_above_slow")
+                    if tc == "fast_above_slow":
+                        trend_ok = row["ema_fast"] > row["ema_slow"]
+                    elif tc == "both_above":
+                        trend_ok = (row["close"] > row["ema_fast"]) and (row["close"] > row["ema_slow"])
+                    else:
+                        trend_ok = True
 
-                            # ADX
-                            adx_ok = row["adx"] >= float(c["adx_min"])
+                    adx_ok = row["adx"] >= float(c["adx_min"])
 
-                            # Multi-TF conferma
-                            if c.get("use_multi_tf_trend", False):
-                                trend_ok = trend_ok and (row["close"] > row.get("ema_slow_htf", row["ema_slow"]))
+                    if c.get("use_multi_tf_trend", False):
+                        trend_ok = trend_ok and (row["close"] > row["ema_slow_htf"])
 
-                            # ATR band (volatilità negoziabile)
-                            atr_rel = (row["atr"] / row["close"]) if row["close"] > 0 else 0.0
-                            atr_ok = (atr_rel >= float(c["atr_filter_min"])) and (atr_rel <= float(c["atr_filter_max"]))
+                    # ATR band
+                    atr_rel = (row["atr"]/row["close"]) if row["close"]>0 else 0.0
+                    atr_ok = (atr_rel >= float(c["atr_filter_min"])) and (atr_rel <= float(c["atr_filter_max"]))
 
-                            if breakout and vol_ok and trend_ok and adx_ok and atr_ok:
-                                pending_entry_idx = i + 1
-                else:
-                    pass  # fuori sessione o superato max giornaliero
+                    if breakout and vol_ok and trend_ok and adx_ok and atr_ok:
+                        pending_entry_idx = i + 1
 
         # Equity MTM
-        mtm = position["remaining_size"] * row["close"] if position else 0.0
-        equity = cash + mtm
-        equity_hist.append({"time": t, "equity": equity})
+        mtm = (position["remaining_size"]*row["close"]) if position else 0.0
+        eq_list.append({"time": t, "equity": cash + mtm})
 
-    # Chiusura a fine serie
+    # chiusura a fine serie
     if position is not None and position["remaining_size"] > 0:
         last = df.iloc[-1]
         px = last["close"] * (1 - slip)
@@ -471,7 +472,7 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
         trades.append({"type":"CLOSE_AT_END","time":df.index[-1],"price":px,"size":size,"pnl":pnl})
         position = None
 
-    eq_df = pd.DataFrame(equity_hist).set_index("time")
+    eq_df = pd.DataFrame(eq_list).set_index("time") if eq_list else pd.DataFrame([], columns=["equity"])
     return {
         "trades": trades,
         "equity_curve": eq_df,
@@ -483,22 +484,21 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
 # -------------------------
 # UI — Sidebar
 # -------------------------
-st.title("ETH Backtest — Long Only (Full Params)")
+st.title("ETH Backtest — Long Only (Stop Modes)")
 
 with st.sidebar:
     st.header("Data Source")
-    data_src = st.selectbox("Fonte dati", ["Binance (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"],
+    data_src = st.selectbox("Fonte dati", ["Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)", "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"],
                             index=["Binance (ccxt)","Binance (REST)","Synthetic Uptrend","Synthetic Downtrend"].index(DEFAULT_CONFIG["data_src"]))
 
-    # Import profilo (JSON)
+    # Import profilo (JSON) — niente rerun: applica al prossimo ciclo
     st.subheader("Profili")
     up = st.file_uploader("Carica profilo (.json)", type=["json"])
     if up is not None:
         try:
             prof = json.load(up)
             st.session_state["pending_profile"] = prof
-            st.success("Profilo caricato. Riavvio per applicare i default…")
-            st.rerun()
+            st.success("Profilo caricato: i valori verranno proposti come default alla prossima esecuzione. Premi 'Run backtest'.")
         except Exception as e:
             st.error(f"JSON non valido: {e}")
 
@@ -517,6 +517,7 @@ with st.sidebar:
 
     # Stops & TPs
     st.subheader("Stops & TPs")
+    stop_mode = st.selectbox("Stop mode", ["Percentuale","ATR","Minimo"], index=["Percentuale","ATR","Minimo"].index(DEFAULT_CONFIG["stop_mode"]))
     stop_loss_pct = st.number_input("Stop loss (%)", value=DEFAULT_CONFIG["stop_loss_pct"]*100.0)/100.0
     tp_ladder_str = st.text_input("TP ladder (comma)", ",".join(map(str, DEFAULT_CONFIG["tp_ladder"])))
     tp_fractions_str = st.text_input("TP fractions (sum=1)", ",".join(map(str, DEFAULT_CONFIG["tp_fractions"])))
@@ -540,7 +541,7 @@ with st.sidebar:
     # Volatilità/filtri
     st.subheader("Volatilità / Filtri")
     atr_period = st.number_input("ATR period", value=int(DEFAULT_CONFIG["atr_period"]), min_value=1)
-    atr_multiplier = st.number_input("ATR multiplier (sizing floor)", value=float(DEFAULT_CONFIG["atr_multiplier"]), min_value=0.0)
+    atr_multiplier = st.number_input("ATR multiplier (stop/sizing)", value=float(DEFAULT_CONFIG["atr_multiplier"]), min_value=0.0)
     adx_period = st.number_input("ADX period", value=int(DEFAULT_CONFIG["adx_period"]), min_value=1)
     adx_min = st.number_input("ADX min", value=float(DEFAULT_CONFIG["adx_min"]), min_value=0.0)
     atr_filter_min = st.number_input("ATR% min (atr/close)", value=float(DEFAULT_CONFIG["atr_filter_min"]), min_value=0.0, max_value=1.0)
@@ -563,12 +564,25 @@ with st.sidebar:
     use_multi_tf_trend = st.checkbox("Use multi-TF trend confirm", value=bool(DEFAULT_CONFIG["use_multi_tf_trend"]))
     higher_tf_multiplier = st.number_input("Higher TF multiplier", value=int(DEFAULT_CONFIG["higher_tf_multiplier"]), min_value=1)
 
-    # Protezioni giornaliere
+    # Protezioni
     st.subheader("Protezioni")
     daily_loss_limit_pct = st.number_input("Daily loss limit (%)", value=float(DEFAULT_CONFIG["daily_loss_limit_pct"]), min_value=0.0)
     equity_stop_pct = st.number_input("Equity stop (%)", value=float(DEFAULT_CONFIG["equity_stop_pct"]), min_value=0.0)
 
     # Compose cfg
+    try:
+        tp_ladder = [float(x.strip()) for x in tp_ladder_str.split(",") if x.strip()!=""]
+        tp_fractions = [float(x.strip()) for x in tp_fractions_str.split(",") if x.strip()!=""]
+        s = sum(tp_fractions)
+        if s <= 0:
+            tp_fractions = [1.0/len(tp_fractions)]*len(tp_fractions) if tp_fractions else [1.0]
+        else:
+            tp_fractions = [f/s for f in tp_fractions]
+    except Exception:
+        st.warning("Errore parsing TP / Fractions: uso default.")
+        tp_ladder = DEFAULT_CONFIG["tp_ladder"]
+        tp_fractions = DEFAULT_CONFIG["tp_fractions"]
+
     cfg: Dict[str, Any] = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -578,8 +592,9 @@ with st.sidebar:
         "fee_pct": float(fee_pct),
         "slippage_pct": float(slippage_pct),
         "stop_loss_pct": float(stop_loss_pct),
-        "tp_ladder": [float(x.strip()) for x in tp_ladder_str.split(",") if x.strip()!=""],
-        "tp_fractions": [float(x.strip()) for x in tp_fractions_str.split(",") if x.strip()!=""],
+        "stop_mode": stop_mode,
+        "tp_ladder": tp_ladder,
+        "tp_fractions": tp_fractions,
         "tp_anticipation_pct": float(tp_anticipation_pct),
         "trailing_start_pct": float(trailing_start_pct),
         "trailing_distance_pct": float(trailing_distance_pct),
@@ -618,8 +633,10 @@ with st.sidebar:
 # -------------------------
 if run_bt:
     with st.spinner("Fetching OHLCV..."):
-        if cfg["data_src"] == "Binance (ccxt)":
-            df = fetch_ohlcv_ccxt(cfg["symbol"], cfg["timeframe"], cfg["lookback"])
+        if "ccxt" in cfg["data_src"]:
+            # Es: "Bybit (ccxt)" -> "bybit"
+            exchange_name = cfg["data_src"].split()[0].lower()
+            df = fetch_ohlcv_ccxt(cfg["symbol"], cfg["timeframe"], cfg["lookback"], exchange_name=exchange_name)
         elif cfg["data_src"] == "Binance (REST)":
             df = fetch_ohlcv_rest_binance(cfg["symbol"], cfg["timeframe"], cfg["lookback"])
         elif cfg["data_src"] == "Synthetic Uptrend":
@@ -661,7 +678,7 @@ if run_bt:
             if t["type"] == "ENTRY":
                 entry_x.append(t["time"]); entry_y.append(t["price"])
                 entry_txt.append(f"ENTRY\nprice={t['price']:.2f}\nsize={t.get('size',0):.6f}")
-            elif t["type"] in ["TP","SL","TRAIL","TIME_STOP","FORCE_CLOSE","FORCE_STOP","CLOSE_AT_END"]:
+            elif t["type"] in ["TP","SL","TRAIL","TIME_STOP","FORCE_CLOSE","CLOSE_AT_END"]:
                 exit_x.append(t["time"]); exit_y.append(t["price"])
                 exit_txt.append(f"{t['type']}\nprice={t['price']:.2f}\npnl={t.get('pnl',0.0):.2f}")
         if entry_x:
@@ -694,3 +711,5 @@ if run_bt:
             st.dataframe(tdf.sort_values("time").reset_index(drop=True))
         else:
             st.info("Nessun trade eseguito con i parametri correnti.")
+
+# Fine file
