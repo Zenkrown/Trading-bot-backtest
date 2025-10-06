@@ -442,17 +442,23 @@ st.title("Crypto trading bot Backtest")
 
 with st.sidebar:
     st.header("Data Source")
-    data_src_options = ["Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)", "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"]
-try:
-    default_index = data_src_options.index(DEFAULT_CONFIG.get("data_src", "Binance (ccxt)"))
-except ValueError:
-    default_index = 0
-data_src = st.selectbox("Fonte dati", data_src_options, index=default_index)
+
+    data_src_options = [
+        "Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)",
+        "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"
+    ]
+
+    try:
+        default_index = data_src_options.index(DEFAULT_CONFIG.get("data_src", "Binance (ccxt)"))
+    except ValueError:
+        default_index = 0
+
+    data_src = st.selectbox("Fonte dati", data_src_options, index=default_index)
 
     # Import profilo (JSON) — niente rerun: applica al prossimo ciclo
-st.subheader("Profili")
-up = st.file_uploader("Carica profilo (.json)", type=["json"])
-if up is not None:
+    st.subheader("Profili")
+    up = st.file_uploader("Carica profilo (.json)", type=["json"])
+    if up is not None:
         try:
             prof = json.load(up)
             st.session_state["pending_profile"] = prof
@@ -463,23 +469,29 @@ if up is not None:
     # Base
     st.subheader("Base")
     symbol = st.text_input("Symbol", DEFAULT_CONFIG["symbol"])
-    timeframe = st.selectbox("Timeframe", ["30m","1h","4h","1d"], index=["30m","1h","4h","1d"].index(DEFAULT_CONFIG["timeframe"]))
-    lookback = st.number_input("Candles (lookback)", value=int(DEFAULT_CONFIG["lookback"]), min_value=200, max_value=5000, step=100)
+    timeframe = st.selectbox("Timeframe", ["30m", "1h", "4h", "1d"],
+                             index=["30m", "1h", "4h", "1d"].index(DEFAULT_CONFIG["timeframe"]))
+    lookback = st.number_input("Candles (lookback)", value=int(DEFAULT_CONFIG["lookback"]),
+                               min_value=200, max_value=5000, step=100)
 
     # Money management
     st.subheader("Money management")
     initial_capital = st.number_input("Initial capital (USD)", value=float(DEFAULT_CONFIG["initial_capital"]), step=100.0)
-    risk_per_trade_pct = st.number_input("Risk per trade (%)", value=DEFAULT_CONFIG["risk_per_trade_pct"]*100.0)/100.0
-    fee_pct = st.number_input("Fee (%)", value=DEFAULT_CONFIG["fee_pct"]*100.0)/100.0
-    slippage_pct = st.number_input("Slippage (%)", value=DEFAULT_CONFIG["slippage_pct"]*100.0)/100.0
+    risk_per_trade_pct = st.number_input("Risk per trade (%)",
+                                         value=DEFAULT_CONFIG["risk_per_trade_pct"] * 100.0) / 100.0
+    fee_pct = st.number_input("Fee (%)", value=DEFAULT_CONFIG["fee_pct"] * 100.0) / 100.0
+    slippage_pct = st.number_input("Slippage (%)", value=DEFAULT_CONFIG["slippage_pct"] * 100.0) / 100.0
 
     # Stops & TPs
     st.subheader("Stops & TPs")
-    stop_mode = st.selectbox("Stop mode", ["Percentuale","ATR","Minimo"], index=["Percentuale","ATR","Minimo"].index(DEFAULT_CONFIG["stop_mode"]))
-    stop_loss_pct = st.number_input("Stop loss (%)", value=DEFAULT_CONFIG["stop_loss_pct"]*100.0)/100.0
+    stop_mode = st.selectbox("Stop mode", ["Percentuale", "ATR", "Minimo"],
+                             index=["Percentuale", "ATR", "Minimo"].index(DEFAULT_CONFIG["stop_mode"]))
+    stop_loss_pct = st.number_input("Stop loss (%)",
+                                    value=DEFAULT_CONFIG["stop_loss_pct"] * 100.0) / 100.0
     tp_ladder_str = st.text_input("TP ladder (comma)", ",".join(map(str, DEFAULT_CONFIG["tp_ladder"])))
     tp_fractions_str = st.text_input("TP fractions (sum=1)", ",".join(map(str, DEFAULT_CONFIG["tp_fractions"])))
-    tp_anticipation_pct = st.number_input("TP anticipation (%)", value=DEFAULT_CONFIG["tp_anticipation_pct"]*100.0)/100.0
+    tp_anticipation_pct = st.number_input("TP anticipation (%)",
+                                          value=DEFAULT_CONFIG["tp_anticipation_pct"] * 100.0) / 100.0
 
     # Trailing
     st.subheader("Trailing")
@@ -671,6 +683,7 @@ if run_bt:
             st.info("Nessun trade eseguito con i parametri correnti.")
 
 # Fine file
+
 
 
 
