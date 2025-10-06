@@ -1,9 +1,9 @@
-# app_backtest_stopmode.py
+# app.py
 # =========================================================
-# Backtest Streamlit — Long Only (ETH) con parametri estesi
-# Fonte dati: Binance (ccxt/REST) o Sintetico (up/down)
-# Import/Export profili JSON (senza rerun; applica su next run)
-# Stop mode: Percentuale | ATR | Min(Percent, ATR)
+# Crypto trading bot Backtest — Long Only (Stop Modes, Multi-Exchange)
+# Fonte dati: ccxt (Binance/Bybit/OKX/Kraken/Coinbase), Binance REST o Sintetico
+# Import/Export profili JSON (applicati come default al prossimo run)
+# Stop mode: Percentuale | ATR | Minimo(Percentuale, ATR)
 # =========================================================
 
 import streamlit as st
@@ -26,7 +26,7 @@ except Exception:
 st.set_page_config(page_title="Crypto trading bot Backtest", layout="wide")
 
 # -------------------------
-# Default config (base + extra)
+# Default config (completo)
 # -------------------------
 DEFAULT_CONFIG: Dict[str, Any] = {
     # Base
@@ -82,11 +82,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "higher_tf_multiplier": 4,       # es. 4 * ema_slow ~ 4H se TF=1H
 
     # Protezioni
-    "daily_loss_limit_pct": 1.0,     # 1% (0 = off) calcolato sul capitale iniziale
+    "daily_loss_limit_pct": 0.0,     # 0 = off (calcolato sul capitale iniziale)
     "equity_stop_pct": 0.0,          # stop globale sull’equity (0 = off)
 
-    # Data source
-    "data_src": "Binance (ccxt)",    # "Binance (ccxt)" | "Binance (REST)" | "Synthetic Uptrend" | "Synthetic Downtrend"
+    # Data source default
+    "data_src": "Bybit (ccxt)",      # evitare 451 su Streamlit Cloud
 }
 
 # -------------------------
@@ -105,13 +105,6 @@ def _true_range(df: pd.DataFrame) -> pd.Series:
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return _true_range(df).rolling(window=int(max(1, period)), min_periods=1).mean()
 
-def donchian(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series]:
-    p = int(max(1, period))
-    return (
-        df["high"].rolling(p, min_periods=1).max(),
-        df["low"].rolling(p, min_periods=1).min(),
-    )
-
 def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     p = int(max(1, period))
     up = df["high"].diff()
@@ -128,7 +121,45 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # -------------------------
 # Data helpers
 # -------------------------
+def fetch_ohlcv_ccxt(symbol: str, timeframe: str, limit: int = 1000, exchange_name: str = "bybit") -> Optional[pd.DataFrame]:
+    """
+    Scarica dati OHLCV da vari exchange via ccxt.
+    exchange_name può essere: binance, bybit, okx, kraken, coinbase, ecc.
+    Prova automaticamente la variante /USD se /USDT non è supportata.
+    """
+    if not HAS_CCXT:
+        st.error("ccxt non installato. `pip install ccxt`")
+        return None
+    try:
+        if not hasattr(ccxt, exchange_name):
+            st.error(f"Exchange non supportato in ccxt: {exchange_name}")
+            return None
+        exchange_class = getattr(ccxt, exchange_name)
+        ex = exchange_class({'enableRateLimit': True})
+
+        tried = []
+        ohlcv = None
+        for sym in [symbol, symbol.replace("USDT", "USD")]:
+            tried.append(sym)
+            try:
+                ohlcv = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=int(limit))
+                if ohlcv:
+                    symbol = sym
+                    break
+            except Exception:
+                continue
+        if not ohlcv:
+            raise RuntimeError(f"Impossibile fetch OHLCV da {exchange_name} per: {tried}")
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.set_index('timestamp').astype(float)
+        return df[['open','high','low','close','volume']]
+    except Exception as e:
+        st.error(f"Errore fetch {exchange_name} (ccxt): {e}")
+        return None
+
 def fetch_ohlcv_rest_binance(symbol: str, interval: str, limit: int = 1000) -> Optional[pd.DataFrame]:
+    """Fallback REST pubblico Binance (potrebbe dare 451 su alcune regioni cloud)."""
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol.replace("/",""), "interval": interval, "limit": int(limit)}
@@ -160,30 +191,31 @@ def synthetic_data(n: int = 1000, seed: int = 42, drift: float = 0.001, vol: flo
     lows = closes * (1.0 - np.maximum(0, vol * 0.5 * rng.standard_normal(n)))
     opens = np.r_[closes[0], closes[:-1]]
     vols = 100 + 10 * rng.random(n)
-    freq = "30min" if timeframe == "30m" else timeframe
-    idx = pd.date_range("2024-01-01", periods=n, freq=freq)
+    # mappa freq pandas
+    freq_map = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1H", "4h": "4H", "1d": "1D"}
+    idx = pd.date_range("2024-01-01", periods=n, freq=freq_map.get(timeframe, "1H"))
     return pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols}, index=idx)
 
 # -------------------------
-# Profili (import/export) — NO rerun
+# Profili (import/export) — NO rerun (applica al prossimo avvio)
 # -------------------------
 PROFILE_DIR = Path("configs"); PROFILE_DIR.mkdir(exist_ok=True)
 
 def merge_defaults(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     out = base.copy()
-    out.update({k:v for k,v in overlay.items() if v is not None})
+    out.update({k: v for k, v in overlay.items() if v is not None})
     return out
 
-# Applica profilo (se presente) PRIMA dei widget
+# Applica profilo (se presente) PRIMA di creare i widget
 if "pending_profile" in st.session_state and isinstance(st.session_state["pending_profile"], dict):
     DEFAULT_CONFIG = merge_defaults(DEFAULT_CONFIG, st.session_state["pending_profile"])
     del st.session_state["pending_profile"]
 
 # -------------------------
-# Backtest Engine (Long Only)
+# Backtest Engine (Long Only) — completo
 # -------------------------
 def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
-    c = c.copy()
+    c = c.copy()  # difensivo contro state-leaks tra run
     df = df.copy()
 
     # Indicatori
@@ -200,9 +232,9 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
         df["ema_slow_htf"] = df["ema_slow"]
 
     # Normalizza TP (con anticipo)
-    tp_ladder = list(c.get("tp_ladder", [0.06,0.12,0.2]))
-    tp_frac = list(c.get("tp_fractions", [0.4,0.3,0.3]))
-    s = sum(tp_frac); tp_frac = [f/s for f in tp_frac] if s > 0 else [1.0/len(tp_frac)]*len(tp_frac)
+    tp_ladder = list(c.get("tp_ladder", [0.06, 0.12, 0.2]))
+    tp_frac = list(c.get("tp_fractions", [0.4, 0.3, 0.3]))
+    s = sum(tp_frac); tp_frac = [f / s for f in tp_frac] if s > 0 else [1.0 / max(1, len(tp_frac))] * max(1, len(tp_frac))
     tp_anticip = float(c.get("tp_anticipation_pct", 0.0))
     tp_factors = [(1.0 + tp) * (1.0 - tp_anticip) for tp in tp_ladder]
 
@@ -251,17 +283,16 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                 stop_pct = entry * (1.0 - float(c["stop_loss_pct"]))
                 stop_atr = entry - float(c["atr_multiplier"]) * float(row["atr"])
 
-                mode = c.get("stop_mode","Percentuale")
+                mode = c.get("stop_mode", "Percentuale")
                 if mode == "Percentuale":
                     stop = stop_pct
                 elif mode == "ATR":
                     stop = stop_atr
-                else:  # Minimo tra i due
-                    # Prezzi positivi -> lo stop "più vicino all'entry" è quello con prezzo più alto
+                else:  # Minimo tra i due -> stop più vicino all'entry (prezzo più alto)
                     stop = max(stop_pct, stop_atr)
 
                 # Filtro ATR% (ambiente negoziabile)
-                atr_rel = (row["atr"]/row["close"]) if row["close"]>0 else 0.0
+                atr_rel = (row["atr"] / row["close"]) if row["close"] > 0 else 0.0
                 if atr_rel >= float(c["atr_filter_min"]) and atr_rel <= float(c["atr_filter_max"]):
                     R = max(entry - stop, 1e-9)
                     risk_amt = cash * risk_pct
@@ -282,13 +313,13 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                             "stop": stop,
                             "tp_prices": [entry * f for f in tp_factors],
                             "tp_fractions": tp_frac.copy(),
-                            "tp_taken": [False]*len(tp_frac),
+                            "tp_taken": [False] * len(tp_frac),
                             "max_price": entry,
                             "trailing_active": False,
                             "trail_price": None,
                             "bars_open": 0
                         }
-                        trades.append({"type":"ENTRY","time":t,"price":entry,"size":size})
+                        trades.append({"type": "ENTRY", "time": t, "price": entry, "size": size})
                         trades_today += 1
                         cooldown = int(c["cooldown_bars"])
             pending_entry_idx = None
@@ -299,7 +330,7 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
             position["max_price"] = max(position["max_price"], row["high"])
 
             # Breakeven
-            if float(c.get("breakeven_stop_pct",0.0)) > 0:
+            if float(c.get("breakeven_stop_pct", 0.0)) > 0:
                 be_level = position["entry_price"] * (1.0 + float(c["breakeven_stop_pct"]))
                 if row["high"] >= be_level:
                     position["stop"] = max(position["stop"], position["entry_price"])
@@ -312,7 +343,7 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                 fee = proceeds * fee_pct
                 cash += proceeds - fee
                 pnl = (proceeds - fee) - (size * position["avg_entry"])
-                trades.append({"type":"SL","time":t,"price":px,"size":size,"pnl":pnl})
+                trades.append({"type": "SL", "time": t, "price": px, "size": size, "pnl": pnl})
                 daily_pnl += pnl
                 position = None
             else:
@@ -328,11 +359,12 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                             pnl = (proceeds - fee) - (size * position["avg_entry"])
                             position["remaining_size"] -= size
                             position["tp_taken"][j] = True
-                            trades.append({"type":"TP","tp_index":j,"time":t,"price":px,"size":size,"pnl":pnl})
+                            trades.append({"type": "TP", "tp_index": j, "time": t, "price": px, "size": size, "pnl": pnl})
                             daily_pnl += pnl
+
                 # Trailing
                 if position is not None:
-                    if (not position["trailing_active"]) and (position["max_price"] >= position["entry_price"]*(1.0 + float(c["trailing_start_pct"]))):
+                    if (not position["trailing_active"]) and (position["max_price"] >= position["entry_price"] * (1.0 + float(c["trailing_start_pct"]))):
                         position["trailing_active"] = True
                         position["trail_price"] = position["max_price"] * (1.0 - float(c["trailing_distance_pct"]))
                     elif position["trailing_active"]:
@@ -344,30 +376,30 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                             fee = proceeds * fee_pct
                             cash += proceeds - fee
                             pnl = (proceeds - fee) - (size * position["avg_entry"])
-                            trades.append({"type":"TRAIL","time":t,"price":px,"size":size,"pnl":pnl})
+                            trades.append({"type": "TRAIL", "time": t, "price": px, "size": size, "pnl": pnl})
                             daily_pnl += pnl
                             position = None
 
                 # Time stop / Force close
                 if position is not None:
-                    if int(c.get("time_stop_bars",0)) > 0 and position["bars_open"] >= int(c["time_stop_bars"]):
+                    if int(c.get("time_stop_bars", 0)) > 0 and position["bars_open"] >= int(c["time_stop_bars"]):
                         px = row["close"] * (1 - slip)
                         size = position["remaining_size"]
                         proceeds = size * px
                         fee = proceeds * fee_pct
                         cash += proceeds - fee
                         pnl = (proceeds - fee) - (size * position["avg_entry"])
-                        trades.append({"type":"TIME_STOP","time":t,"price":px,"size":size,"pnl":pnl})
+                        trades.append({"type": "TIME_STOP", "time": t, "price": px, "size": size, "pnl": pnl})
                         daily_pnl += pnl
                         position = None
-                    elif int(c.get("force_close_bars",0)) > 0 and position["bars_open"] >= int(c["force_close_bars"]):
+                    elif int(c.get("force_close_bars", 0)) > 0 and position["bars_open"] >= int(c["force_close_bars"]):
                         px = row["close"] * (1 - slip)
                         size = position["remaining_size"]
                         proceeds = size * px
                         fee = proceeds * fee_pct
                         cash += proceeds - fee
                         pnl = (proceeds - fee) - (size * position["avg_entry"])
-                        trades.append({"type":"FORCE_CLOSE","time":t,"price":px,"size":size,"pnl":pnl})
+                        trades.append({"type": "FORCE_CLOSE", "time": t, "price": px, "size": size, "pnl": pnl})
                         daily_pnl += pnl
                         position = None
 
@@ -375,22 +407,21 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                     position = None
 
         # Nuove entry se flat
-        if position is None and pending_entry_idx is None and i < n-1:
+        if position is None and pending_entry_idx is None and i < n - 1:
             # daily loss limit
-            if float(c.get("daily_loss_limit_pct",0.0)) > 0:
-                if daily_pnl <= -abs(float(c["daily_loss_limit_pct"]) * float(c["initial_capital"])):
-                    pass  # stop per la giornata
+            if float(c.get("daily_loss_limit_pct", 0.0)) > 0 and daily_pnl <= -abs(float(c["daily_loss_limit_pct"]) * float(c["initial_capital"])):
+                pass  # stop per la giornata
             # cooldown
-            if cooldown > 0:
+            elif cooldown > 0:
                 cooldown -= 1
             else:
                 # condizioni segnale
                 if in_session(t) and trades_today < int(c["max_trades_per_day"]):
-                    prev_high = df["high"].iloc[i-1] if i >= 1 else df["high"].iloc[i]
+                    prev_high = df["high"].iloc[i - 1] if i >= 1 else df["high"].iloc[i]
                     breakout = row["high"] > prev_high * (1.0 + float(c["breakout_threshold_pct"]))
                     vol_ok = row["volume"] >= df["vol_ma"].iloc[i] * float(c["min_volume_factor"])
 
-                    tc = c.get("trend_condition","fast_above_slow")
+                    tc = c.get("trend_condition", "fast_above_slow")
                     if tc == "fast_above_slow":
                         trend_ok = row["ema_fast"] > row["ema_slow"]
                     elif tc == "both_above":
@@ -404,14 +435,14 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                         trend_ok = trend_ok and (row["close"] > row["ema_slow_htf"])
 
                     # ATR band
-                    atr_rel = (row["atr"]/row["close"]) if row["close"]>0 else 0.0
+                    atr_rel = (row["atr"] / row["close"]) if row["close"] > 0 else 0.0
                     atr_ok = (atr_rel >= float(c["atr_filter_min"])) and (atr_rel <= float(c["atr_filter_max"]))
 
                     if breakout and vol_ok and trend_ok and adx_ok and atr_ok:
                         pending_entry_idx = i + 1
 
         # Equity MTM
-        mtm = (position["remaining_size"]*row["close"]) if position else 0.0
+        mtm = (position["remaining_size"] * row["close"]) if position else 0.0
         eq_list.append({"time": t, "equity": cash + mtm})
 
     # chiusura a fine serie
@@ -423,10 +454,10 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
         fee = proceeds * fee_pct
         cash += proceeds - fee
         pnl = (proceeds - fee) - (size * position["avg_entry"])
-        trades.append({"type":"CLOSE_AT_END","time":df.index[-1],"price":px,"size":size,"pnl":pnl})
+        trades.append({"type": "CLOSE_AT_END", "time": df.index[-1], "price": px, "size": size, "pnl": pnl})
         position = None
 
-    eq_df = pd.DataFrame(eq_list).set_index("time") if eq_list else pd.DataFrame([], columns=["equity"])
+    eq_df = pd.DataFrame(eq_list).set_index("time") if eq_list else pd.DataFrame([], columns=["equity"]).set_index(pd.Index([]))
     return {
         "trades": trades,
         "equity_curve": eq_df,
@@ -443,16 +474,12 @@ st.title("Crypto trading bot Backtest")
 with st.sidebar:
     st.header("Data Source")
 
-    data_src_options = [
-        "Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)",
-        "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"
-    ]
-
+    data_src_options = ["Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)",
+                        "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"]
     try:
-        default_index = data_src_options.index(DEFAULT_CONFIG.get("data_src", "Binance (ccxt)"))
+        default_index = data_src_options.index(DEFAULT_CONFIG.get("data_src", "Bybit (ccxt)"))
     except ValueError:
-        default_index = 0
-
+        default_index = 1
     data_src = st.selectbox("Fonte dati", data_src_options, index=default_index)
 
     # Import profilo (JSON) — niente rerun: applica al prossimo ciclo
@@ -469,29 +496,28 @@ with st.sidebar:
     # Base
     st.subheader("Base")
     symbol = st.text_input("Symbol", DEFAULT_CONFIG["symbol"])
-    timeframe = st.selectbox("Timeframe", ["30m", "1h", "4h", "1d"],
-                             index=["30m", "1h", "4h", "1d"].index(DEFAULT_CONFIG["timeframe"]))
-    lookback = st.number_input("Candles (lookback)", value=int(DEFAULT_CONFIG["lookback"]),
-                               min_value=200, max_value=5000, step=100)
+    timeframe_list = ["1m","5m","15m","30m","1h","4h","1d"]
+    try:
+        tf_index = timeframe_list.index(DEFAULT_CONFIG["timeframe"])
+    except ValueError:
+        tf_index = 4  # 1h
+    timeframe = st.selectbox("Timeframe", timeframe_list, index=tf_index)
+    lookback = st.number_input("Candles (lookback)", value=int(DEFAULT_CONFIG["lookback"]), min_value=200, max_value=5000, step=100)
 
     # Money management
     st.subheader("Money management")
     initial_capital = st.number_input("Initial capital (USD)", value=float(DEFAULT_CONFIG["initial_capital"]), step=100.0)
-    risk_per_trade_pct = st.number_input("Risk per trade (%)",
-                                         value=DEFAULT_CONFIG["risk_per_trade_pct"] * 100.0) / 100.0
-    fee_pct = st.number_input("Fee (%)", value=DEFAULT_CONFIG["fee_pct"] * 100.0) / 100.0
-    slippage_pct = st.number_input("Slippage (%)", value=DEFAULT_CONFIG["slippage_pct"] * 100.0) / 100.0
+    risk_per_trade_pct = st.number_input("Risk per trade (%)", value=DEFAULT_CONFIG["risk_per_trade_pct"]*100.0)/100.0
+    fee_pct = st.number_input("Fee (%)", value=DEFAULT_CONFIG["fee_pct"]*100.0)/100.0
+    slippage_pct = st.number_input("Slippage (%)", value=DEFAULT_CONFIG["slippage_pct"]*100.0)/100.0
 
     # Stops & TPs
     st.subheader("Stops & TPs")
-    stop_mode = st.selectbox("Stop mode", ["Percentuale", "ATR", "Minimo"],
-                             index=["Percentuale", "ATR", "Minimo"].index(DEFAULT_CONFIG["stop_mode"]))
-    stop_loss_pct = st.number_input("Stop loss (%)",
-                                    value=DEFAULT_CONFIG["stop_loss_pct"] * 100.0) / 100.0
+    stop_mode = st.selectbox("Stop mode", ["Percentuale","ATR","Minimo"], index=["Percentuale","ATR","Minimo"].index(DEFAULT_CONFIG["stop_mode"]))
+    stop_loss_pct = st.number_input("Stop loss (%)", value=DEFAULT_CONFIG["stop_loss_pct"]*100.0)/100.0
     tp_ladder_str = st.text_input("TP ladder (comma)", ",".join(map(str, DEFAULT_CONFIG["tp_ladder"])))
     tp_fractions_str = st.text_input("TP fractions (sum=1)", ",".join(map(str, DEFAULT_CONFIG["tp_fractions"])))
-    tp_anticipation_pct = st.number_input("TP anticipation (%)",
-                                          value=DEFAULT_CONFIG["tp_anticipation_pct"] * 100.0) / 100.0
+    tp_anticipation_pct = st.number_input("TP anticipation (%)", value=DEFAULT_CONFIG["tp_anticipation_pct"]*100.0)/100.0
 
     # Trailing
     st.subheader("Trailing")
@@ -604,8 +630,7 @@ with st.sidebar:
 if run_bt:
     with st.spinner("Fetching OHLCV..."):
         if "ccxt" in cfg["data_src"]:
-            # Es: "Bybit (ccxt)" -> "bybit"
-            exchange_name = cfg["data_src"].split()[0].lower()
+            exchange_name = cfg["data_src"].split()[0].lower()  # es: "Bybit (ccxt)" -> "bybit"
             df = fetch_ohlcv_ccxt(cfg["symbol"], cfg["timeframe"], cfg["lookback"], exchange_name=exchange_name)
         elif cfg["data_src"] == "Binance (REST)":
             df = fetch_ohlcv_rest_binance(cfg["symbol"], cfg["timeframe"], cfg["lookback"])
@@ -681,9 +706,3 @@ if run_bt:
             st.dataframe(tdf.sort_values("time").reset_index(drop=True))
         else:
             st.info("Nessun trade eseguito con i parametri correnti.")
-
-# Fine file
-
-
-
-
