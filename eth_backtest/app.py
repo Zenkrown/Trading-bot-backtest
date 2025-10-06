@@ -451,8 +451,8 @@ data_src = st.selectbox("Fonte dati", data_src_options, index=default_index)
 
     # Import profilo (JSON) — niente rerun: applica al prossimo ciclo
 st.subheader("Profili")
-    up = st.file_uploader("Carica profilo (.json)", type=["json"])
-    if up is not None:
+up = st.file_uploader("Carica profilo (.json)", type=["json"])
+if up is not None:
         try:
             prof = json.load(up)
             st.session_state["pending_profile"] = prof
@@ -671,5 +671,6 @@ if run_bt:
             st.info("Nessun trade eseguito con i parametri correnti.")
 
 # Fine file
+
 
 
