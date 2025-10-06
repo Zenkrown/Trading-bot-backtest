@@ -128,7 +128,7 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # -------------------------
 # Data helpers
 # -------------------------
-\1\2def fetch_ohlcv_rest_binance(symbol: str, interval: str, limit: int = 1000) -> Optional[pd.DataFrame]:
+def fetch_ohlcv_rest_binance(symbol: str, interval: str, limit: int = 1000) -> Optional[pd.DataFrame]:
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol.replace("/",""), "interval": interval, "limit": int(limit)}
@@ -671,3 +671,4 @@ if run_bt:
             st.info("Nessun trade eseguito con i parametri correnti.")
 
 # Fine file
+
