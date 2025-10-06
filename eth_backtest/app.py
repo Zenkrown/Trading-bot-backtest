@@ -23,7 +23,7 @@ try:
 except Exception:
     HAS_CCXT = False
 
-st.set_page_config(page_title="ETH Backtest — Long Only (Stop Modes)", layout="wide")
+st.set_page_config(page_title="Crypto trading bot Backtest", layout="wide")
 
 # -------------------------
 # Default config (base + extra)
@@ -128,54 +128,7 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # -------------------------
 # Data helpers
 # -------------------------
-def fetch_ohlcv_ccxt(symbol: str, timeframe: str, limit: int = 1000, exchange_name: str = "binance") -> Optional[pd.DataFrame]:
-    """
-    Scarica dati OHLCV da vari exchange via ccxt.
-    exchange_name può essere: binance, bybit, okx, kraken, coinbase, ecc.
-    Prova automaticamente la variante /USD se /USDT non è supportata.
-    """
-    if not HAS_CCXT:
-        st.error("ccxt non installato. `pip install ccxt`")
-        return None
-    try:
-        # Istanzia l'exchange in base al nome
-        if not hasattr(ccxt, exchange_name):
-            st.error(f"Exchange non supportato in ccxt: {exchange_name}")
-            return None
-        exchange_class = getattr(ccxt, exchange_name)
-        ex = exchange_class({'enableRateLimit': True})
-
-        # Alcuni exchange hanno nomi simbolo diversi (USDT vs USD)
-        tried = []
-        for sym in [symbol, symbol.replace("USDT", "USD")]:
-            try:
-                tried.append(sym)
-                ohlcv = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=int(limit))
-                break
-            except Exception:
-                ohlcv = None
-        if not ohlcv:
-            raise RuntimeError(f"Impossibile fetch OHLCV da {exchange_name} per i simboli provati: {tried}")
-
-        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.set_index('timestamp').astype(float)
-        return df[['open','high','low','close','volume']]
-    except Exception as e:
-        st.error(f"Errore fetch {exchange_name} (ccxt): {e}")
-        return None
-    try:
-        ex = ccxt.binance({'enableRateLimit': True})
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.set_index('timestamp').astype(float)
-        return df[['open','high','low','close','volume']]
-    except Exception as e:
-        st.error(f"Errore fetch Binance (ccxt): {e}")
-        return None
-
-def fetch_ohlcv_rest_binance(symbol: str, interval: str, limit: int = 1000) -> Optional[pd.DataFrame]:
+\1\2def fetch_ohlcv_rest_binance(symbol: str, interval: str, limit: int = 1000) -> Optional[pd.DataFrame]:
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol.replace("/",""), "interval": interval, "limit": int(limit)}
@@ -222,7 +175,7 @@ def merge_defaults(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, A
     return out
 
 # Applica profilo (se presente) PRIMA dei widget
-if "pending_profile" in st.session_state:
+if "pending_profile" in st.session_state and isinstance(st.session_state["pending_profile"], dict):
     DEFAULT_CONFIG = merge_defaults(DEFAULT_CONFIG, st.session_state["pending_profile"])
     del st.session_state["pending_profile"]
 
@@ -230,6 +183,7 @@ if "pending_profile" in st.session_state:
 # Backtest Engine (Long Only)
 # -------------------------
 def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
+    c = c.copy()
     df = df.copy()
 
     # Indicatori
@@ -484,12 +438,16 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
 # -------------------------
 # UI — Sidebar
 # -------------------------
-st.title("ETH Backtest — Long Only (Stop Modes)")
+st.title("Crypto trading bot Backtest")
 
 with st.sidebar:
     st.header("Data Source")
-    data_src = st.selectbox("Fonte dati", ["Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)", "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"],
-                            index=["Binance (ccxt)","Binance (REST)","Synthetic Uptrend","Synthetic Downtrend"].index(DEFAULT_CONFIG["data_src"]))
+    data_src_options = ["Binance (ccxt)", "Bybit (ccxt)", "OKX (ccxt)", "Kraken (ccxt)", "Coinbase (ccxt)", "Binance (REST)", "Synthetic Uptrend", "Synthetic Downtrend"]
+try:
+    default_index = data_src_options.index(DEFAULT_CONFIG.get("data_src", "Binance (ccxt)"))
+except ValueError:
+    default_index = 0
+data_src = st.selectbox("Fonte dati", data_src_options, index=default_index)
 
     # Import profilo (JSON) — niente rerun: applica al prossimo ciclo
     st.subheader("Profili")
