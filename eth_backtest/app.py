@@ -294,47 +294,49 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                 # Filtro ATR% (ambiente negoziabile)
                 atr_rel = (row["atr"] / row["close"]) if row["close"] > 0 else 0.0
                 if atr_rel >= float(c["atr_filter_min"]) and atr_rel <= float(c["atr_filter_max"]):
-# --- Calcolo posizione e controllo capitale ---
-R = max(entry - stop, 1e-9)
+                    
+                # --- Calcolo posizione e controllo capitale ---
+                R = max(entry - stop, 1e-9)
 
-# Clamp risk_per_trade_pct a valori realistici (0.01% - 10%)
-risk_pct = float(c["risk_per_trade_pct"])
-risk_pct = min(max(risk_pct, 0.0001), 0.1)
+                # Clamp risk_per_trade_pct a valori realistici (0.01% - 10%)
+                risk_pct = float(c["risk_per_trade_pct"])
+                risk_pct = min(max(risk_pct, 0.0001), 0.1)
 
-risk_amt = cash * risk_pct
+                risk_amt = cash * risk_pct
+                
+                # sizing floor su ATR (opzionale): garantisce R minimo
+                if float(c["atr_multiplier"]) > 0:
+                    R = max(R, float(c["atr_multiplier"]) * float(row["atr"]))
+                
+                size = risk_amt / R
+                notional = size * entry
+                fee = notional * fee_pct
+                
+                # Debug info: spiega perché eventuali trade vengono saltati
+                if (notional + fee) > cash:
+                    st.warning(f"Trade skipped: notional {notional:.2f} + fee {fee:.2f} > cash {cash:.2f}")
+                
+                if size > 0 and (notional + fee) <= cash:
+                    cash -= (notional + fee)
+                    position = {
+                        "entry_time": t,
+                        "entry_price": entry,
+                        "avg_entry": entry,
+                        "size": size,
+                        "remaining_size": size,
+                        "stop": stop,
+                        "tp_prices": [entry * f for f in tp_factors],
+                        "tp_fractions": tp_frac.copy(),
+                        "tp_taken": [False] * len(tp_frac),
+                        "max_price": entry,
+                        "trailing_active": False,
+                        "trail_price": None,
+                        "bars_open": 0
+                    }
+                    trades.append({"type": "ENTRY", "time": t, "price": entry, "size": size})
+                    trades_today += 1
+                    cooldown = int(c["cooldown_bars"])
 
-# sizing floor su ATR (opzionale): garantisce R minimo
-if float(c["atr_multiplier"]) > 0:
-    R = max(R, float(c["atr_multiplier"]) * float(row["atr"]))
-
-size = risk_amt / R
-notional = size * entry
-fee = notional * fee_pct
-
-# Debug info: spiega perché eventuali trade vengono saltati
-if (notional + fee) > cash:
-    st.warning(f"Trade skipped: notional {notional:.2f} + fee {fee:.2f} > cash {cash:.2f}")
-
-if size > 0 and (notional + fee) <= cash:
-    cash -= (notional + fee)
-    position = {
-        "entry_time": t,
-        "entry_price": entry,
-        "avg_entry": entry,
-        "size": size,
-        "remaining_size": size,
-        "stop": stop,
-        "tp_prices": [entry * f for f in tp_factors],
-        "tp_fractions": tp_frac.copy(),
-        "tp_taken": [False] * len(tp_frac),
-        "max_price": entry,
-        "trailing_active": False,
-        "trail_price": None,
-        "bars_open": 0
-    }
-    trades.append({"type": "ENTRY", "time": t, "price": entry, "size": size})
-    trades_today += 1
-    cooldown = int(c["cooldown_bars"])
         # Gestione posizione
         if position is not None:
             position["bars_open"] += 1
@@ -717,4 +719,5 @@ if run_bt:
             st.dataframe(tdf.sort_values("time").reset_index(drop=True))
         else:
             st.info("Nessun trade eseguito con i parametri correnti.")
+
 
