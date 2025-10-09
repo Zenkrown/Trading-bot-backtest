@@ -294,7 +294,7 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                 # Filtro ATR% (ambiente negoziabile)
                 atr_rel = (row["atr"] / row["close"]) if row["close"] > 0 else 0.0
                 if atr_rel >= float(c["atr_filter_min"]) and atr_rel <= float(c["atr_filter_max"]):
-                    # --- Calcolo posizione e controllo capitale ---
+    # --- Calcolo posizione e controllo capitale ---
 R = max(entry - stop, 1e-9)
 
 # Clamp risk_per_trade_pct a valori realistici (0.01% - 10%)
