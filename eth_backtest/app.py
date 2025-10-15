@@ -335,6 +335,7 @@ def run_backtest(df: pd.DataFrame, c: Dict[str, Any]) -> Dict[str, Any]:
                         trades.append({"type": "ENTRY", "time": t, "price": entry, "size": size})
                         trades_today += 1
                         cooldown = int(c["cooldown_bars"])
+                        pending_entry_idx = None
        # Gestione posizione
         if position is not None:
             position["bars_open"] += 1
