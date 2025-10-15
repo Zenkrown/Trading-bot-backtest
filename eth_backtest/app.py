@@ -30,7 +30,7 @@ st.set_page_config(page_title="Crypto trading bot Backtest", layout="wide")
 # -------------------------
 DEFAULT_CONFIG: Dict[str, Any] = {
     # Base
-    "symbol": "ETH/USDT",
+    "symbol": "SOL/USDT",
     "timeframe": "1h",
     "lookback": 1000,
 
